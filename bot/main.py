@@ -4,9 +4,12 @@ Telegram-бот ВКР: выбор темы из Notion, пошаговые бр
 """
 import os
 import logging
+from datetime import time
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 load_dotenv()
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -21,10 +24,13 @@ from bot.database import (
     ensure_student,
     set_selected_brief,
     get_selected_brief,
+    clear_selected_brief,
     add_help_request,
+    get_help_requests,
     set_checklist_item,
     get_checklist_checked,
     get_all_checklist_results,
+    get_all_students_with_progress,
 )
 from bot.notion_client import (
     fetch_briefs,
@@ -42,6 +48,10 @@ logger = logging.getLogger(__name__)
 NOTION_BRIEFS_PAGE_ID = os.environ.get("NOTION_BRIEFS_PAGE_ID", "")
 _ADMIN_IDS_RAW = os.environ.get("VKR_ADMIN_IDS", "354573537").strip()
 ADMIN_IDS = set(int(x) for x in _ADMIN_IDS_RAW.split() if x.strip())
+# Утреннее напоминание: время (часы, минуты) и часовой пояс
+REMINDER_HOUR = int(os.environ.get("VKR_REMINDER_HOUR", "11"))
+REMINDER_MINUTE = int(os.environ.get("VKR_REMINDER_MINUTE", "0"))
+REMINDER_TZ = os.environ.get("VKR_BOT_TZ", "Europe/Moscow")
 
 
 def get_briefs(context: ContextTypes.DEFAULT_TYPE):
@@ -80,12 +90,77 @@ def _checklist_message(items: list, checked: set, url: str, brief_index: int) ->
     return text, InlineKeyboardMarkup(buttons)
 
 
+def _topic_menu_message(brief: dict, url: str) -> tuple:
+    """Текст и клавиатура меню выбранной темы (для start и callback)."""
+    title = _topic_only(brief.get("title", "Бриф"))
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Открыть бриф в Notion", url=url)],
+        [
+            InlineKeyboardButton("✅ Чеклист", callback_data="menu:checklist"),
+            InlineKeyboardButton("🖥 Окружение", callback_data="menu:environment"),
+        ],
+        [
+            InlineKeyboardButton("📦 Продукт", callback_data="menu:product"),
+            InlineKeyboardButton("📋 Шаги по порядку", callback_data="menu:steps"),
+        ],
+        [
+            InlineKeyboardButton("🆘 Нужна помощь", callback_data="menu:help"),
+            InlineKeyboardButton("📅 Нужен прогон/встреча", callback_data="menu:meeting"),
+        ],
+    ])
+    return f"Тема: {title}\n\nВыберите раздел или откройте бриф в Notion:", keyboard
+
+
 def _topic_only(title: str) -> str:
     """Убирает префикс 'Бриф для студента: ', оставляет только тему."""
     if not title:
         return title
     prefix = "Бриф для студента: "
     return title[len(prefix):].strip() if title.startswith(prefix) else title
+
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для админа: сбросить выбранную тему студента. /reset <telegram_id>"""
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("Недоступно.")
+        return
+    args = (context.args or [])
+    if args and args[0].strip().lstrip("-").isdigit():
+        target_id = int(args[0].strip())
+        clear_selected_brief(target_id)
+        await update.message.reply_text(
+            f"Тема сброшена для пользователя {target_id}. При следующем /start он снова выберет тему."
+        )
+        return
+    rows = get_all_students_with_progress()
+    lines = ["Использование: /reset <telegram_id>\n\nСтуденты (ID — имя):"]
+    for r in rows:
+        name = f"{r['first_name'] or ''} {r['last_name'] or ''}".strip() or (r["username"] or "—")
+        lines.append(f"  {r['user_id']} — {name} (@{r['username'] or '—'})")
+    await update.message.reply_text("\n".join(lines) if len(lines) > 1 else "Использование: /reset <telegram_id>\n\nСтудентов пока нет.")
+
+
+async def morning_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневное напоминание админам о необработанных заявках (помощь / встреча)."""
+    requests = get_help_requests(resolved=False)
+    if not requests:
+        return
+    kind_labels = {"help": "Нужна помощь", "meeting": "Нужен прогон/встреча"}
+    lines = ["📋 Необработанные заявки:\n"]
+    for r in requests:
+        kind = kind_labels.get(r["kind"], r["kind"])
+        who = f"{r['first_name'] or ''} {r['last_name'] or ''}".strip() or (r["username"] or "—")
+        lines.append(f"• {kind} — {who} (@{r['username'] or '—'}), ID {r['user_id']}")
+        if r.get("comment"):
+            lines.append(f"  «{r['comment'][:200]}{'…' if len(r.get('comment', '')) > 200 else ''}»")
+        lines.append(f"  {r['created_at']}")
+    text = "\n".join(lines)
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text)
+        except Exception as e:
+            logger.warning("Утреннее напоминание админу %s: %s", admin_id, e)
 
 
 async def progress_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -160,6 +235,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Если тема уже выбрана — сразу показать меню темы
+    selected = get_selected_brief(user.id)
+    if selected is not None and 0 <= selected < len(briefs):
+        brief = briefs[selected]
+        if brief.get("type") == "child_page":
+            url = page_url(brief["page_id"])
+            text, keyboard = _topic_menu_message(brief, url)
+            await update.message.reply_text(text, reply_markup=keyboard)
+            return
+
     buttons = []
     for i, b in enumerate(briefs):
         if b.get("type") != "child_page":
@@ -189,6 +274,15 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_student(user.id, user.username, user.first_name, user.last_name)
 
     data = query.data
+    try:
+        await _callback_brief_handle(update, context, query, user, data)
+    except BadRequest as e:
+        if "not modified" not in (e.message or "").lower():
+            raise
+
+
+async def _callback_brief_handle(update: Update, context: ContextTypes.DEFAULT_TYPE, query, user, data: str):
+    """Внутренняя логика callback_brief (отдельно, чтобы ловить BadRequest снаружи)."""
     if data.startswith("brief:"):
         idx = int(data.split(":")[1])
         briefs = get_briefs(context)
@@ -201,27 +295,9 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         set_selected_brief(user.id, idx)
         page_id = brief["page_id"]
-        title = _topic_only(brief.get("title", "Бриф"))
         url = page_url(page_id)
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📄 Открыть бриф в Notion", url=url)],
-            [
-                InlineKeyboardButton("✅ Чеклист", callback_data="menu:checklist"),
-                InlineKeyboardButton("🖥 Окружение", callback_data="menu:environment"),
-            ],
-            [
-                InlineKeyboardButton("📦 Продукт", callback_data="menu:product"),
-                InlineKeyboardButton("📋 Шаги по порядку", callback_data="menu:steps"),
-            ],
-            [
-                InlineKeyboardButton("🆘 Нужна помощь", callback_data="menu:help"),
-                InlineKeyboardButton("📅 Нужен прогон/встреча", callback_data="menu:meeting"),
-            ],
-        ])
-        await query.edit_message_text(
-            f"Тема: {title}\n\nВыберите раздел или откройте бриф в Notion:",
-            reply_markup=keyboard,
-        )
+        text, keyboard = _topic_menu_message(brief, url)
+        await query.edit_message_text(text, reply_markup=keyboard)
         return
 
     if data.startswith("menu:"):
@@ -375,27 +451,9 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Тема не найдена. /start")
             return
         brief = briefs[brief_index]
-        title = _topic_only(brief.get("title", "Бриф"))
         url = page_url(brief["page_id"])
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📄 Открыть бриф в Notion", url=url)],
-            [
-                InlineKeyboardButton("✅ Чеклист", callback_data="menu:checklist"),
-                InlineKeyboardButton("🖥 Окружение", callback_data="menu:environment"),
-            ],
-            [
-                InlineKeyboardButton("📦 Продукт", callback_data="menu:product"),
-                InlineKeyboardButton("📋 Шаги по порядку", callback_data="menu:steps"),
-            ],
-            [
-                InlineKeyboardButton("🆘 Нужна помощь", callback_data="menu:help"),
-                InlineKeyboardButton("📅 Нужен прогон/встреча", callback_data="menu:meeting"),
-            ],
-        ])
-        await query.edit_message_text(
-            f"Тема: {title}\n\nВыберите раздел или откройте бриф в Notion:",
-            reply_markup=keyboard,
-        )
+        text, keyboard = _topic_menu_message(brief, url)
+        await query.edit_message_text(text, reply_markup=keyboard)
 
 
 def _format_step(step: dict, num: int, total: int, url: str) -> str:
@@ -420,8 +478,13 @@ def main():
     if not token:
         raise SystemExit("Задайте TELEGRAM_BOT_TOKEN")
     app = Application.builder().token(token).build()
+    # Ежедневно в 11:00 (или VKR_REMINDER_HOUR:VKR_REMINDER_MINUTE) — напоминание о заявках
+    tz = ZoneInfo(REMINDER_TZ)
+    reminder_time = time(REMINDER_HOUR, REMINDER_MINUTE, tzinfo=tz)
+    app.job_queue.run_daily(morning_reminder_job, reminder_time)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("progress", progress_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_message))
     app.add_handler(CallbackQueryHandler(callback_brief))
     app.run_polling(allowed_updates=Update.ALL_TYPES)

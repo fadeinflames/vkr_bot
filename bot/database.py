@@ -97,6 +97,14 @@ def get_selected_brief(user_id: int) -> int | None:
     return row[0] if row and row[0] is not None else None
 
 
+def clear_selected_brief(user_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE students SET selected_brief_index = NULL WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
 def mark_brief_done(user_id: int, brief_index: int):
     conn = get_connection()
     cur = conn.cursor()
