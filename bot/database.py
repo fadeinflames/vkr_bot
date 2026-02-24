@@ -46,6 +46,17 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES students(user_id)
         )
     """)
+    # Прогресс по чеклисту: студент отметил пункт (brief_index + item_index в рамках брифа)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS checklist_progress (
+            user_id INTEGER,
+            brief_index INTEGER,
+            item_index INTEGER,
+            completed_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (user_id, brief_index, item_index),
+            FOREIGN KEY (user_id) REFERENCES students(user_id)
+        )
+    """)
     try:
         cur.execute("ALTER TABLE students ADD COLUMN selected_brief_index INTEGER")
     except sqlite3.OperationalError:
@@ -165,3 +176,54 @@ def resolve_help_request(request_id: int):
     cur.execute("UPDATE help_requests SET resolved = 1 WHERE id = ?", (request_id,))
     conn.commit()
     conn.close()
+
+
+# --- Чеклист: отметки студентов ---
+
+
+def set_checklist_item(user_id: int, brief_index: int, item_index: int, completed: bool):
+    conn = get_connection()
+    cur = conn.cursor()
+    if completed:
+        cur.execute(
+            "INSERT OR REPLACE INTO checklist_progress (user_id, brief_index, item_index) VALUES (?, ?, ?)",
+            (user_id, brief_index, item_index),
+        )
+    else:
+        cur.execute(
+            "DELETE FROM checklist_progress WHERE user_id = ? AND brief_index = ? AND item_index = ?",
+            (user_id, brief_index, item_index),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_checklist_checked(user_id: int, brief_index: int) -> set:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT item_index FROM checklist_progress WHERE user_id = ? AND brief_index = ?",
+        (user_id, brief_index),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return {r[0] for r in rows}
+
+
+def get_all_checklist_results():
+    """Для админа: (user_id, brief_index, total_items, completed_count), с именами из students."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT s.user_id, s.first_name, s.last_name, s.username, s.selected_brief_index,
+               (SELECT COUNT(*) FROM checklist_progress cp WHERE cp.user_id = s.user_id AND cp.brief_index = s.selected_brief_index) AS completed
+        FROM students s
+        WHERE s.selected_brief_index IS NOT NULL
+        ORDER BY s.first_name, s.last_name
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {"user_id": r[0], "first_name": r[1], "last_name": r[2], "username": r[3], "brief_index": r[4], "completed_count": r[5]}
+        for r in rows
+    ]

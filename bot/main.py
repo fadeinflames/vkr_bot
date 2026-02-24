@@ -11,7 +11,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 from bot.database import (
@@ -20,6 +22,9 @@ from bot.database import (
     set_selected_brief,
     get_selected_brief,
     add_help_request,
+    set_checklist_item,
+    get_checklist_checked,
+    get_all_checklist_results,
 )
 from bot.notion_client import (
     fetch_briefs,
@@ -59,6 +64,22 @@ def _back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("◀ Назад", callback_data="menu_back")]])
 
 
+def _checklist_message(items: list, checked: set, url: str, brief_index: int) -> tuple:
+    """Текст чеклиста и клавиатура с кнопками переключения по пунктам."""
+    lines = ["Чеклист (нажми пункт, чтобы отметить):\n"]
+    buttons = []
+    for i, it in enumerate(items):
+        done = i in checked
+        mark = "✅" if done else "☐"
+        line_text = (it.get("text") or "")[:60]
+        lines.append(f"{mark} {i + 1}. {line_text}")
+        btn_label = f"{'✅' if done else '☐'} {i + 1}"
+        buttons.append([InlineKeyboardButton(btn_label, callback_data=f"chk:{brief_index}:{i}")])
+    text = "\n".join(lines) + f"\n\nПодробнее в Notion: {url}"
+    buttons.append([InlineKeyboardButton("◀ Назад", callback_data="menu_back")])
+    return text, InlineKeyboardMarkup(buttons)
+
+
 def _topic_only(title: str) -> str:
     """Убирает префикс 'Бриф для студента: ', оставляет только тему."""
     if not title:
@@ -67,8 +88,69 @@ def _topic_only(title: str) -> str:
     return title[len(prefix):].strip() if title.startswith(prefix) else title
 
 
+async def progress_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для админа: прогресс по чеклистам студентов."""
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("Недоступно.")
+        return
+    rows = get_all_checklist_results()
+    if not rows:
+        await update.message.reply_text("Пока ни у кого не выбран бриф с чеклистом.")
+        return
+    briefs = get_briefs(context)
+    lines = ["Прогресс по чеклистам:\n"]
+    for r in rows:
+        name = f"{r['first_name'] or ''} {r['last_name'] or ''}".strip() or r["username"] or "—"
+        bidx = r["brief_index"]
+        done = r["completed_count"]
+        total = 0
+        if bidx is not None and bidx < len(briefs):
+            content = get_brief_content(context, briefs[bidx]["page_id"])
+            total = len(content.get("checklist", []))
+        total = total or "?"
+        lines.append(f"• {name} (@{r['username'] or '—'}): {done}/{total}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _notify_admin_help(context: ContextTypes.DEFAULT_TYPE, kind: str, who: str, username: str, user_id: int, comment: str):
+    kind_label = "Нужна помощь" if kind == "help" else "Нужен прогон/встреча"
+    emoji = "🆘" if kind == "help" else "📅"
+    admin_text = (
+        f"{emoji} {kind_label}\n\n"
+        f"Кто: {who}\n"
+        f"Username: @{username or '—'}\n"
+        f"ID: {user_id}\n\n"
+        f"Текст: {comment}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=admin_text)
+        except Exception as e:
+            logger.warning("Не удалось отправить уведомление админу %s: %s", admin_id, e)
+
+
+async def handle_input_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текста: форма помощи или окна для встречи."""
+    user = update.effective_user
+    awaiting = context.user_data.pop("awaiting_input", None)
+    if not awaiting:
+        return
+    text = (update.message.text or "").strip()
+    if not text:
+        context.user_data["awaiting_input"] = awaiting
+        await update.message.reply_text("Напишите текст или нажмите Отмена в сообщении выше.")
+        return
+    ensure_student(user.id, user.username, user.first_name, user.last_name)
+    add_help_request(user.id, awaiting, text)
+    who = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username or "Без имени"
+    await _notify_admin_help(context, awaiting, who, user.username, user.id, text)
+    await update.message.reply_text("Заявка отправлена. С вами свяжутся.")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    context.user_data.pop("awaiting_input", None)
     ensure_student(user.id, user.username, user.first_name, user.last_name)
 
     briefs = get_briefs(context)
@@ -131,7 +213,10 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("📦 Продукт", callback_data="menu:product"),
                 InlineKeyboardButton("📋 Шаги по порядку", callback_data="menu:steps"),
             ],
-            [InlineKeyboardButton("🆘 Нужна помощь / встреча", callback_data="menu:help")],
+            [
+                InlineKeyboardButton("🆘 Нужна помощь", callback_data="menu:help"),
+                InlineKeyboardButton("📅 Нужен прогон/встреча", callback_data="menu:meeting"),
+            ],
         ])
         await query.edit_message_text(
             f"Тема: {title}\n\nВыберите раздел или откройте бриф в Notion:",
@@ -158,13 +243,11 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
             items = content.get("checklist", [])
             if not items:
                 text = "Чеклист в брифе не найден.\n\nОткройте бриф в Notion: " + url
+                await query.edit_message_text(text, reply_markup=_back_keyboard())
             else:
-                lines = ["Чеклист:\n"]
-                for it in items:
-                    mark = "✅" if it.get("checked") else "☐"
-                    lines.append(f"{mark} {it.get('text', '')}")
-                text = "\n".join(lines) + f"\n\nПодробнее в Notion: {url}"
-            await query.edit_message_text(text, reply_markup=_back_keyboard())
+                checked = get_checklist_checked(user.id, brief_index)
+                text, keyboard = _checklist_message(items, checked, url, brief_index)
+                await query.edit_message_text(text, reply_markup=keyboard)
 
         elif kind == "environment":
             sec = content.get("sections", {}).get("environment", {})
@@ -199,23 +282,18 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(msg, reply_markup=keyboard)
 
         elif kind == "help":
-            add_help_request(user.id, "meeting", "")
-            # Уведомление админу
-            who = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username or "Без имени"
-            admin_text = (
-                f"🆘 Запрос на помощь/встречу\n\n"
-                f"Кто: {who}\n"
-                f"Username: @{user.username or '—'}\n"
-                f"ID: {user.id}"
-            )
-            for admin_id in ADMIN_IDS:
-                try:
-                    await context.bot.send_message(chat_id=admin_id, text=admin_text)
-                except Exception as e:
-                    logger.warning("Не удалось отправить уведомление админу %s: %s", admin_id, e)
+            context.user_data["awaiting_input"] = "help"
+            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="input_cancel")]])
             await query.edit_message_text(
-                "Заявка на помощь/встречу отправлена. С вами свяжутся.",
-                reply_markup=_back_keyboard(),
+                "Опишите, с чем нужна помощь (напишите текстом в чат):",
+                reply_markup=cancel_kb,
+            )
+        elif kind == "meeting":
+            context.user_data["awaiting_input"] = "meeting"
+            cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="input_cancel")]])
+            await query.edit_message_text(
+                "Укажите удобные окна для встречи/прогона (например: пн 15:00, ср после 18:00). Напишите в чат:",
+                reply_markup=cancel_kb,
             )
         return
 
@@ -251,6 +329,42 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
+    if data.startswith("chk:"):
+        # Переключить пункт чеклиста: chk:brief_index:item_index
+        parts = data.split(":")
+        if len(parts) != 3:
+            await query.answer()
+            return
+        try:
+            brief_idx = int(parts[1])
+            item_idx = int(parts[2])
+        except ValueError:
+            await query.answer()
+            return
+        checked = get_checklist_checked(user.id, brief_idx)
+        new_state = item_idx not in checked
+        set_checklist_item(user.id, brief_idx, item_idx, new_state)
+        # Обновить сообщение чеклиста
+        briefs = get_briefs(context)
+        if brief_idx >= len(briefs):
+            await query.answer("Тема не найдена.")
+            return
+        page_id = briefs[brief_idx]["page_id"]
+        content = get_brief_content(context, page_id)
+        items = content.get("checklist", [])
+        if item_idx >= len(items):
+            await query.answer()
+            return
+        checked = get_checklist_checked(user.id, brief_idx)
+        url = page_url(page_id)
+        text, keyboard = _checklist_message(items, checked, url, brief_idx)
+        await query.edit_message_text(text, reply_markup=keyboard)
+        await query.answer("Отмечено" if new_state else "Снято")
+
+    if data == "input_cancel":
+        context.user_data.pop("awaiting_input", None)
+        await query.edit_message_text("Ввод отменён.", reply_markup=_back_keyboard())
+
     if data == "menu_back":
         brief_index = get_selected_brief(user.id)
         if brief_index is None:
@@ -273,7 +387,10 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("📦 Продукт", callback_data="menu:product"),
                 InlineKeyboardButton("📋 Шаги по порядку", callback_data="menu:steps"),
             ],
-            [InlineKeyboardButton("🆘 Нужна помощь / встреча", callback_data="menu:help")],
+            [
+                InlineKeyboardButton("🆘 Нужна помощь", callback_data="menu:help"),
+                InlineKeyboardButton("📅 Нужен прогон/встреча", callback_data="menu:meeting"),
+            ],
         ])
         await query.edit_message_text(
             f"Тема: {title}\n\nВыберите раздел или откройте бриф в Notion:",
@@ -304,6 +421,8 @@ def main():
         raise SystemExit("Задайте TELEGRAM_BOT_TOKEN")
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("progress", progress_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_message))
     app.add_handler(CallbackQueryHandler(callback_brief))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
