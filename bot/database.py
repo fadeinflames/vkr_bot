@@ -101,6 +101,7 @@ def clear_selected_brief(user_id: int):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("UPDATE students SET selected_brief_index = NULL WHERE user_id = ?", (user_id,))
+    cur.execute("DELETE FROM checklist_progress WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 

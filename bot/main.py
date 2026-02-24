@@ -78,8 +78,17 @@ CHECKLIST_PAGE_SIZE = 5
 
 
 def _checklist_message(items: list, checked: set, url: str, brief_index: int, page: int = 0) -> tuple:
-    """Текст чеклиста и клавиатура: только неотмеченные, по 5 на страницу."""
-    unchecked = [i for i in range(len(items)) if i not in checked]
+    """Текст чеклиста и клавиатура: только неотмеченные, по 5 на страницу, без дублей по тексту."""
+    seen_text = set()
+    unchecked = []
+    for i in range(len(items)):
+        if i in checked:
+            continue
+        t = (items[i].get("text") or "").strip()
+        if not t or t in seen_text:
+            continue
+        seen_text.add(t)
+        unchecked.append(i)
     total = len(items)
     left = len(unchecked)
     if left == 0:
@@ -378,7 +387,7 @@ async def _callback_brief_handle(update: Update, context: ContextTypes.DEFAULT_T
             context.user_data["brief_page_url"] = url
             step = steps[0]
             msg = _format_step(step, 1, len(steps), url)
-            keyboard = _steps_keyboard(0, len(steps))
+            keyboard = _steps_keyboard(0, len(steps), url)
             await query.edit_message_text(msg, reply_markup=keyboard)
 
         elif kind == "help":
@@ -441,10 +450,6 @@ async def _callback_brief_handle(update: Update, context: ContextTypes.DEFAULT_T
         except ValueError:
             await query.answer()
             return
-        checked = get_checklist_checked(user.id, brief_idx)
-        new_state = item_idx not in checked
-        set_checklist_item(user.id, brief_idx, item_idx, new_state)
-        # Обновить сообщение чеклиста
         briefs = get_briefs(context)
         if brief_idx >= len(briefs):
             await query.answer("Тема не найдена.")
@@ -455,6 +460,14 @@ async def _callback_brief_handle(update: Update, context: ContextTypes.DEFAULT_T
         if item_idx >= len(items):
             await query.answer()
             return
+        checked = get_checklist_checked(user.id, brief_idx)
+        new_state = item_idx not in checked
+        set_checklist_item(user.id, brief_idx, item_idx, new_state)
+        if new_state:
+            item_text = (items[item_idx].get("text") or "").strip()
+            for j in range(len(items)):
+                if j != item_idx and (items[j].get("text") or "").strip() == item_text:
+                    set_checklist_item(user.id, brief_idx, j, True)
         checked = get_checklist_checked(user.id, brief_idx)
         url = page_url(page_id)
         text, keyboard = _checklist_message(items, checked, url, brief_idx, page=0)
