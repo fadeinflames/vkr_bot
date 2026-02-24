@@ -13,7 +13,9 @@ def get_connection():
 def init_db():
     conn = get_connection()
     cur = conn.cursor()
-    # Студенты (Telegram user_id как ключ), selected_brief_index — выбранная тема ВКР
+    # Студенты (Telegram user_id как ключ),
+    # selected_brief_index — выбранная тема ВКР,
+    # current_step_index — следующий шаг в разделе "Шаги по порядку".
     cur.execute("""
         CREATE TABLE IF NOT EXISTS students (
             user_id INTEGER PRIMARY KEY,
@@ -21,6 +23,7 @@ def init_db():
             first_name TEXT,
             last_name TEXT,
             selected_brief_index INTEGER,
+            current_step_index INTEGER,
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
@@ -57,8 +60,13 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES students(user_id)
         )
     """)
+    # Колонки могут быть добавлены позже — пытаемся добавить их, игнорируя ошибки, если уже существуют.
     try:
         cur.execute("ALTER TABLE students ADD COLUMN selected_brief_index INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cur.execute("ALTER TABLE students ADD COLUMN current_step_index INTEGER")
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -100,7 +108,10 @@ def get_selected_brief(user_id: int) -> int | None:
 def clear_selected_brief(user_id: int):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE students SET selected_brief_index = NULL WHERE user_id = ?", (user_id,))
+    cur.execute(
+        "UPDATE students SET selected_brief_index = NULL, current_step_index = NULL WHERE user_id = ?",
+        (user_id,),
+    )
     cur.execute("DELETE FROM checklist_progress WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
@@ -228,6 +239,29 @@ def get_checklist_checked(user_id: int, brief_index: int) -> set:
     rows = cur.fetchall()
     conn.close()
     return {r[0] for r in rows}
+
+
+def set_current_step(user_id: int, step_index: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE students SET current_step_index = ? WHERE user_id = ?",
+        (step_index, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_current_step(user_id: int) -> int | None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT current_step_index FROM students WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row and row[0] is not None else None
 
 
 def get_all_checklist_results():

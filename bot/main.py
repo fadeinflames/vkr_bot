@@ -32,6 +32,9 @@ from bot.database import (
     get_checklist_checked,
     get_all_checklist_results,
     get_all_students_with_progress,
+    set_current_step,
+    get_current_step,
+    mark_brief_done,
 )
 from bot.notion_client import (
     fetch_briefs,
@@ -386,11 +389,16 @@ async def _callback_brief_handle(update: Update, context: ContextTypes.DEFAULT_T
                 await query.edit_message_text(text, reply_markup=_back_keyboard())
                 return
             context.user_data["brief_steps"] = steps
-            context.user_data["brief_step_index"] = 0
             context.user_data["brief_page_url"] = url
-            step = steps[0]
-            msg = _format_step(step, 1, len(steps), url)
-            keyboard = _steps_keyboard(0, len(steps), url)
+            saved_idx = get_current_step(user.id)
+            if saved_idx is None or saved_idx < 0 or saved_idx >= len(steps):
+                idx = 0
+            else:
+                idx = saved_idx
+            context.user_data["brief_step_index"] = idx
+            step = steps[idx]
+            msg = _format_step(step, idx + 1, len(steps), url)
+            keyboard = _steps_keyboard(idx, len(steps), url)
             await query.edit_message_text(msg, reply_markup=keyboard)
 
         elif kind == "help":
@@ -439,6 +447,48 @@ async def _callback_brief_handle(update: Update, context: ContextTypes.DEFAULT_T
         keyboard = _steps_keyboard(idx, n, url)
         await query.edit_message_text(msg, reply_markup=keyboard)
         await query.answer()
+        return
+
+    if data.startswith("stepdone:"):
+        # Отметить шаг как пройденный и перейти к следующему
+        parts = data.split(":")
+        if len(parts) != 2:
+            await query.answer()
+            return
+        try:
+            done_idx = int(parts[1])
+        except ValueError:
+            await query.answer()
+            return
+        brief_index = get_selected_brief(user.id)
+        if brief_index is None:
+            await query.answer("Сначала выберите тему: /start")
+            return
+        steps = context.user_data.get("brief_steps", [])
+        url = context.user_data.get("brief_page_url", "")
+        if not steps:
+            await query.answer("Шаги не загружены. Выберите 'Шаги по порядку' снова.")
+            return
+        total = len(steps)
+        next_idx = done_idx + 1
+        if next_idx >= total:
+            # Все шаги пройдены
+            set_current_step(user.id, total - 1)
+            mark_brief_done(user.id, brief_index)
+            await query.edit_message_text(
+                f"Все шаги по теме пройдены! 🎉\n\nПодробнее в Notion: {url}",
+                reply_markup=_back_keyboard(),
+            )
+            await query.answer("Бриф отмечен как пройденный")
+            return
+        # Сохраняем следующий шаг как текущий
+        set_current_step(user.id, next_idx)
+        context.user_data["brief_step_index"] = next_idx
+        step = steps[next_idx]
+        msg = _format_step(step, next_idx + 1, total, url)
+        keyboard = _steps_keyboard(next_idx, total, url)
+        await query.edit_message_text(msg, reply_markup=keyboard)
+        await query.answer("Шаг отмечен, идём дальше")
         return
 
     if data.startswith("chk:"):
@@ -527,13 +577,21 @@ def _format_step(step: dict, num: int, total: int, url: str) -> str:
 
 
 def _steps_keyboard(current: int, total: int, url: str) -> InlineKeyboardMarkup:
-    row = []
+    rows = []
+    nav = []
     if current > 0:
-        row.append(InlineKeyboardButton("◀ Пред", callback_data="step:prev"))
+        nav.append(InlineKeyboardButton("◀ Пред", callback_data="step:prev"))
     if current < total - 1:
-        row.append(InlineKeyboardButton("След ▶", callback_data="step:next"))
-    row.append(InlineKeyboardButton("В меню", callback_data="menu_back"))
-    return InlineKeyboardMarkup([row])
+        nav.append(InlineKeyboardButton("След ▶", callback_data="step:next"))
+    if nav:
+        rows.append(nav)
+    rows.append(
+        [
+            InlineKeyboardButton("✅ Я прошёл этот шаг", callback_data=f"stepdone:{current}"),
+            InlineKeyboardButton("В меню", callback_data="menu_back"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def main():
