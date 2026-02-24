@@ -74,19 +74,36 @@ def _back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("◀ Назад", callback_data="menu_back")]])
 
 
-def _checklist_message(items: list, checked: set, url: str, brief_index: int) -> tuple:
-    """Текст чеклиста и клавиатура с кнопками переключения по пунктам."""
-    lines = ["Чеклист (нажми пункт, чтобы отметить):\n"]
+CHECKLIST_PAGE_SIZE = 5
+
+
+def _checklist_message(items: list, checked: set, url: str, brief_index: int, page: int = 0) -> tuple:
+    """Текст чеклиста и клавиатура: только неотмеченные, по 5 на страницу."""
+    unchecked = [i for i in range(len(items)) if i not in checked]
+    total = len(items)
+    left = len(unchecked)
+    if left == 0:
+        text = f"Чеклист: все пункты отмечены.\n\nВсего было {total} пунктов.\n\nПодробнее в Notion: {url}"
+        return text, _back_keyboard()
+    total_pages = max(1, (left + CHECKLIST_PAGE_SIZE - 1) // CHECKLIST_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * CHECKLIST_PAGE_SIZE
+    page_indices = unchecked[start : start + CHECKLIST_PAGE_SIZE]
+    lines = [f"Чеклист (осталось {left} из {total}):\n"]
     buttons = []
-    for i, it in enumerate(items):
-        done = i in checked
-        mark = "✅" if done else "☐"
-        line_text = (it.get("text") or "")[:60]
-        lines.append(f"{mark} {i + 1}. {line_text}")
-        btn_label = f"{'✅' if done else '☐'} {i + 1}"
-        buttons.append([InlineKeyboardButton(btn_label, callback_data=f"chk:{brief_index}:{i}")])
-    text = "\n".join(lines) + f"\n\nПодробнее в Notion: {url}"
+    for num, i in enumerate(page_indices, 1):
+        line_text = (items[i].get("text") or "")[:55]
+        lines.append(f"☐ {num}. {line_text}")
+        buttons.append([InlineKeyboardButton(f"☐ {num}", callback_data=f"chk:{brief_index}:{i}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Пред", callback_data=f"clpage:{brief_index}:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("След ▶", callback_data=f"clpage:{brief_index}:{page + 1}"))
+    if nav:
+        buttons.append(nav)
     buttons.append([InlineKeyboardButton("◀ Назад", callback_data="menu_back")])
+    text = "\n".join(lines) + f"\n\nПодробнее в Notion: {url}"
     return text, InlineKeyboardMarkup(buttons)
 
 
@@ -269,7 +286,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except BadRequest as e:
+        msg = (e.message or "").lower()
+        if "too old" in msg or "invalid" in msg or "expired" in msg or "timeout" in msg:
+            logger.debug("Callback query expired, продолжаем: %s", e.message)
+        else:
+            raise
     user = query.from_user
     ensure_student(user.id, user.username, user.first_name, user.last_name)
 
@@ -433,9 +457,33 @@ async def _callback_brief_handle(update: Update, context: ContextTypes.DEFAULT_T
             return
         checked = get_checklist_checked(user.id, brief_idx)
         url = page_url(page_id)
-        text, keyboard = _checklist_message(items, checked, url, brief_idx)
+        text, keyboard = _checklist_message(items, checked, url, brief_idx, page=0)
         await query.edit_message_text(text, reply_markup=keyboard)
         await query.answer("Отмечено" if new_state else "Снято")
+
+    if data.startswith("clpage:"):
+        # Пагинация чеклиста: clpage:brief_index:page
+        parts = data.split(":")
+        if len(parts) != 3:
+            return
+        try:
+            brief_idx = int(parts[1])
+            cl_page = int(parts[2])
+        except ValueError:
+            return
+        brief_index = get_selected_brief(user.id)
+        if brief_index is None or brief_idx != brief_index:
+            return
+        briefs = get_briefs(context)
+        if brief_idx >= len(briefs):
+            return
+        page_id = briefs[brief_idx]["page_id"]
+        content = get_brief_content(context, page_id)
+        items = content.get("checklist", [])
+        checked = get_checklist_checked(user.id, brief_idx)
+        url = page_url(page_id)
+        text, keyboard = _checklist_message(items, checked, url, brief_idx, page=cl_page)
+        await query.edit_message_text(text, reply_markup=keyboard)
 
     if data == "input_cancel":
         context.user_data.pop("awaiting_input", None)
