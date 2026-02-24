@@ -478,10 +478,14 @@ def main():
     if not token:
         raise SystemExit("Задайте TELEGRAM_BOT_TOKEN")
     app = Application.builder().token(token).build()
-    # Ежедневно в 11:00 (или VKR_REMINDER_HOUR:VKR_REMINDER_MINUTE) — напоминание о заявках
-    tz = ZoneInfo(REMINDER_TZ)
-    reminder_time = time(REMINDER_HOUR, REMINDER_MINUTE, tzinfo=tz)
-    app.job_queue.run_daily(morning_reminder_job, reminder_time)
+    # Ежедневно в 11:00 (или VKR_REMINDER_*) — напоминание о заявках (нужен пакет python-telegram-bot[job-queue])
+    if app.job_queue:
+        tz = ZoneInfo(REMINDER_TZ)
+        reminder_time = time(REMINDER_HOUR, REMINDER_MINUTE, tzinfo=tz)
+        app.job_queue.run_daily(morning_reminder_job, reminder_time)
+        logger.info("Утреннее напоминание запланировано на %s:%s (%s)", REMINDER_HOUR, REMINDER_MINUTE, REMINDER_TZ)
+    else:
+        logger.warning("JobQueue недоступен: установите python-telegram-bot[job-queue]. Утреннее напоминание отключено.")
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("progress", progress_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
