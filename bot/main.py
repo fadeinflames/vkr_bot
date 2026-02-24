@@ -193,7 +193,7 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = context.user_data.get("brief_step_index", 0)
         url = context.user_data.get("brief_page_url", "")
         if not steps:
-            await query.answer("Шаги не загружены. Выберите «Шаги по порядку» снова.")
+            await query.answer("Шаги не загружены. Выберите 'Шаги по порядку' снова.")
             return
         n = len(steps)
         if direction == "prev":
