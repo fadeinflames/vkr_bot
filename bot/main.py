@@ -273,7 +273,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-</think>
-Добавляю callback `menu_back` и исправляю кнопку «В меню» для шагов.
-<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>
-StrReplace
