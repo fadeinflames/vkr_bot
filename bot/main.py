@@ -25,6 +25,7 @@ from bot.database import (
     set_selected_brief,
     get_selected_brief,
     clear_selected_brief,
+    clear_checklist_progress,
     add_help_request,
     get_help_requests,
     set_checklist_item,
@@ -155,8 +156,10 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if args and args[0].strip().lstrip("-").isdigit():
         target_id = int(args[0].strip())
         clear_selected_brief(target_id)
+        n = clear_checklist_progress(target_id)
+        logger.info("Reset пользователя %s: тема и чеклист сброшены (удалено записей чеклиста: %s)", target_id, n)
         await update.message.reply_text(
-            f"Тема сброшена для пользователя {target_id}. При следующем /start он снова выберет тему."
+            f"Тема и чеклист сброшены для пользователя {target_id}. При следующем /start он снова выберет тему."
         )
         return
     rows = get_all_students_with_progress()

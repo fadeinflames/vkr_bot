@@ -106,6 +106,17 @@ def clear_selected_brief(user_id: int):
     conn.close()
 
 
+def clear_checklist_progress(user_id: int) -> int:
+    """Удаляет все отметки чеклиста для пользователя. Возвращает количество удалённых строк."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM checklist_progress WHERE user_id = ?", (user_id,))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
+
+
 def mark_brief_done(user_id: int, brief_index: int):
     conn = get_connection()
     cur = conn.cursor()
