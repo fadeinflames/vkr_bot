@@ -1,0 +1,12 @@
+services:
+  vkr-bot:
+    build: .
+    env_file: .env
+    environment:
+      - VKR_DB_PATH=/data/vkr_bot.db
+    volumes:
+      - vkr-bot-data:/data
+    restart: unless-stopped
+
+volumes:
+  vkr-bot-data:
