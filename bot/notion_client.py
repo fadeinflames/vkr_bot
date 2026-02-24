@@ -173,10 +173,13 @@ def parse_brief_page(blocks: list) -> dict:
     sections = {}
     current_content = []
 
+    # Лимит превью для шага (секции «Продукт»/«Окружение» — полный список, лимит Telegram 4096)
+    PREVIEW_MAX = 3600
+
     def flush_content():
         nonlocal current_content
         if current_content and steps:
-            steps[-1]["content_preview"] = "\n".join(current_content)[:400]
+            steps[-1]["content_preview"] = "\n".join(current_content)[:PREVIEW_MAX]
         current_content = []
 
     for b in blocks:
@@ -196,19 +199,21 @@ def parse_brief_page(blocks: list) -> dict:
         elif t == "heading_3" and steps:
             current_content.append(text)
         elif t == "paragraph" and text and steps:
-            current_content.append(text[:200])
+            current_content.append(text[:400])
         elif t == "to_do":
             item_text, checked = _to_do_text(b)
             checklist.append({"text": item_text, "checked": checked})
         elif t == "bulleted_list_item" and text and steps:
-            current_content.append("• " + text[:150])
+            current_content.append("• " + text[:280])
+        elif t == "numbered_list_item" and text and steps:
+            current_content.append(text[:280])
 
     flush_content()
 
-    # превью для секций environment/product — взять из шагов
+    # превью для секций environment/product — полный текст раздела (до лимита Telegram ~4k)
     for step in steps:
         lower = step["title"].lower()
-        prev = (step.get("content_preview") or "")[:300]
+        prev = (step.get("content_preview") or "")[:3600]
         if "инфраструктур" in lower or "окружен" in lower or "кластер" in lower:
             sections["environment"] = {"title": step["title"], "preview": prev}
         elif "демо-приложен" in lower or "выбор приложен" in lower or "приложен" in lower:

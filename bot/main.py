@@ -35,7 +35,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 NOTION_BRIEFS_PAGE_ID = os.environ.get("NOTION_BRIEFS_PAGE_ID", "")
-ADMIN_IDS = set(int(x) for x in os.environ.get("VKR_ADMIN_IDS", "").split() if x.strip())
+_ADMIN_IDS_RAW = os.environ.get("VKR_ADMIN_IDS", "354573537").strip()
+ADMIN_IDS = set(int(x) for x in _ADMIN_IDS_RAW.split() if x.strip())
 
 
 def get_briefs(context: ContextTypes.DEFAULT_TYPE):
@@ -53,6 +54,19 @@ def get_brief_content(context: ContextTypes.DEFAULT_TYPE, page_id: str):
     return cache[page_id]
 
 
+def _back_keyboard() -> InlineKeyboardMarkup:
+    """Кнопка «Назад» в меню раздела."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("◀ Назад", callback_data="menu_back")]])
+
+
+def _topic_only(title: str) -> str:
+    """Убирает префикс 'Бриф для студента: ', оставляет только тему."""
+    if not title:
+        return title
+    prefix = "Бриф для студента: "
+    return title[len(prefix):].strip() if title.startswith(prefix) else title
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_student(user.id, user.username, user.first_name, user.last_name)
@@ -66,10 +80,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     buttons = []
     for i, b in enumerate(briefs):
-        if b.get("type") == "child_page":
-            title = (b.get("title") or "")[:50]
-            buttons.append([InlineKeyboardButton(title, callback_data=f"brief:{i}")])
+        if b.get("type") != "child_page":
+            continue
+        full_title = b.get("title") or ""
+        if full_title.startswith("Задачи для ВКР"):
+            continue
+        title = _topic_only(full_title)[:50]
+        buttons.append([InlineKeyboardButton(title, callback_data=f"brief:{i}")])
 
+    if not buttons:
+        await update.message.reply_text(
+            "Список тем ВКР временно пуст. Обратитесь к куратору."
+        )
+        return
     keyboard = InlineKeyboardMarkup(buttons)
     await update.message.reply_text(
         "Выберите тему ВКР:",
@@ -96,7 +119,7 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         set_selected_brief(user.id, idx)
         page_id = brief["page_id"]
-        title = brief.get("title", "Бриф")
+        title = _topic_only(brief.get("title", "Бриф"))
         url = page_url(page_id)
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📄 Открыть бриф в Notion", url=url)],
@@ -141,7 +164,7 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     mark = "✅" if it.get("checked") else "☐"
                     lines.append(f"{mark} {it.get('text', '')}")
                 text = "\n".join(lines) + f"\n\nПодробнее в Notion: {url}"
-            await query.edit_message_text(text)
+            await query.edit_message_text(text, reply_markup=_back_keyboard())
 
         elif kind == "environment":
             sec = content.get("sections", {}).get("environment", {})
@@ -150,7 +173,7 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = f"🖥 {title}\n\n{preview}\n\nОткрыть раздел в Notion: {url}"
             if not preview:
                 text = f"🖥 {title}\n\nПодробности в брифе в Notion: {url}"
-            await query.edit_message_text(text)
+            await query.edit_message_text(text, reply_markup=_back_keyboard())
 
         elif kind == "product":
             sec = content.get("sections", {}).get("product", {})
@@ -159,13 +182,13 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = f"📦 {title}\n\n{preview}\n\nОткрыть раздел в Notion: {url}"
             if not preview:
                 text = f"📦 {title}\n\nПодробности в брифе в Notion: {url}"
-            await query.edit_message_text(text)
+            await query.edit_message_text(text, reply_markup=_back_keyboard())
 
         elif kind == "steps":
             steps = content.get("steps", [])
             if not steps:
                 text = f"Шаги не найдены.\n\nОткройте бриф в Notion: {url}"
-                await query.edit_message_text(text)
+                await query.edit_message_text(text, reply_markup=_back_keyboard())
                 return
             context.user_data["brief_steps"] = steps
             context.user_data["brief_step_index"] = 0
@@ -177,8 +200,22 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif kind == "help":
             add_help_request(user.id, "meeting", "")
+            # Уведомление админу
+            who = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username or "Без имени"
+            admin_text = (
+                f"🆘 Запрос на помощь/встречу\n\n"
+                f"Кто: {who}\n"
+                f"Username: @{user.username or '—'}\n"
+                f"ID: {user.id}"
+            )
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(chat_id=admin_id, text=admin_text)
+                except Exception as e:
+                    logger.warning("Не удалось отправить уведомление админу %s: %s", admin_id, e)
             await query.edit_message_text(
-                "Заявка на помощь/встречу отправлена. С вами свяжутся."
+                "Заявка на помощь/встречу отправлена. С вами свяжутся.",
+                reply_markup=_back_keyboard(),
             )
         return
 
@@ -224,7 +261,7 @@ async def callback_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Тема не найдена. /start")
             return
         brief = briefs[brief_index]
-        title = brief.get("title", "Бриф")
+        title = _topic_only(brief.get("title", "Бриф"))
         url = page_url(brief["page_id"])
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📄 Открыть бриф в Notion", url=url)],
