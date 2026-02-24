@@ -35,6 +35,8 @@ from bot.database import (
     set_current_step,
     get_current_step,
     mark_brief_done,
+    add_faq,
+    list_faq,
 )
 from bot.notion_client import (
     fetch_briefs,
@@ -137,6 +139,7 @@ def _topic_menu_message(brief: dict, url: str) -> tuple:
             InlineKeyboardButton("🆘 Нужна помощь", callback_data="menu:help"),
             InlineKeyboardButton("📅 Нужен прогон/встреча", callback_data="menu:meeting"),
         ],
+        [InlineKeyboardButton("❓ FAQ", callback_data="menu:faq")],
     ])
     return f"Тема: {title}\n\nВыберите раздел или откройте бриф в Notion:", keyboard
 
@@ -173,6 +176,44 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines) if len(lines) > 1 else "Использование: /reset <telegram_id>\n\nСтудентов пока нет.")
 
 
+def _format_faq() -> str:
+    rows = list_faq()
+    if not rows:
+        return "FAQ пока пуст.\n\nЗадайте вопросы куратору — он добавит сюда ответы."
+    lines = ["FAQ:\n"]
+    for idx, r in enumerate(rows, 1):
+        q = (r["question"] or "").strip()
+        a = (r["answer"] or "").strip()
+        if not q and not a:
+            continue
+        lines.append(f"{idx}. {q}")
+        if a:
+            lines.append(f"   {a}")
+        lines.append("")  # пустая строка между ответами
+    return "\n".join(lines).rstrip()
+
+
+async def faq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать FAQ всем пользователям."""
+    text = _format_faq()
+    await update.message.reply_text(text)
+
+
+async def addfaq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для админа: добавить запись в FAQ (диалог вопрос/ответ)."""
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("Недоступно.")
+        return
+    context.user_data["awaiting_input"] = "faq_q"
+    context.user_data.pop("faq_question", None)
+    cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="input_cancel")]])
+    await update.message.reply_text(
+        "Напишите текст вопроса для FAQ. После этого я попрошу ответ.",
+        reply_markup=cancel_kb,
+    )
+
+
 async def morning_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     """Ежедневное напоминание админам о необработанных заявках (помощь / встреча)."""
     requests = get_help_requests(resolved=False)
@@ -201,22 +242,48 @@ async def progress_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id not in ADMIN_IDS:
         await update.message.reply_text("Недоступно.")
         return
-    rows = get_all_checklist_results()
+    rows = get_all_students_with_progress()
     if not rows:
-        await update.message.reply_text("Пока ни у кого не выбран бриф с чеклистом.")
+        await update.message.reply_text("Студентов пока нет.")
         return
     briefs = get_briefs(context)
-    lines = ["Прогресс по чеклистам:\n"]
+    lines = ["Статус студентов:\n"]
     for r in rows:
-        name = f"{r['first_name'] or ''} {r['last_name'] or ''}".strip() or r["username"] or "—"
-        bidx = r["brief_index"]
-        done = r["completed_count"]
-        total = 0
-        if bidx is not None and bidx < len(briefs):
-            content = get_brief_content(context, briefs[bidx]["page_id"])
-            total = len(content.get("checklist", []))
-        total = total or "?"
-        lines.append(f"• {name} (@{r['username'] or '—'}): {done}/{total}")
+        name = f"{r['first_name'] or ''} {r['last_name'] or ''}".strip() or (r["username"] or "—")
+        bidx = r["selected_brief_index"]
+        cur_step = r["current_step_index"]
+        username = r["username"] or "—"
+
+        if bidx is None or bidx < 0 or bidx >= len(briefs):
+            lines.append(f"• {name} (@{username}): тема не выбрана")
+            continue
+
+        brief = briefs[bidx]
+        title = _topic_only(brief.get("title", "Бриф"))[:60]
+        content = get_brief_content(context, brief["page_id"])
+        steps = content.get("steps", []) or []
+        checklist = content.get("checklist", []) or []
+
+        steps_total = len(steps)
+        if steps_total:
+            if cur_step is None or cur_step < 0 or cur_step >= steps_total:
+                step_idx = 0
+            else:
+                step_idx = cur_step
+            step_num = step_idx + 1
+            step_title = steps[step_idx].get("title", "")[:60]
+            step_part = f"шаг {step_num}/{steps_total}: {step_title}"
+        else:
+            step_part = "шаги не заданы в брифе"
+
+        total_cl = len(checklist)
+        if total_cl:
+            done_cl = len(get_checklist_checked(r["user_id"], bidx))
+            cl_part = f"чеклист {done_cl}/{total_cl}"
+        else:
+            cl_part = "чеклист отсутствует"
+
+        lines.append(f"• {name} (@{username}): тема «{title}», {step_part}, {cl_part}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -238,9 +305,9 @@ async def _notify_admin_help(context: ContextTypes.DEFAULT_TYPE, kind: str, who:
 
 
 async def handle_input_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текста: форма помощи или окна для встречи."""
+    """Обработка текста: форма помощи/встречи или добавление FAQ."""
     user = update.effective_user
-    awaiting = context.user_data.pop("awaiting_input", None)
+    awaiting = context.user_data.get("awaiting_input")
     if not awaiting:
         return
     text = (update.message.text or "").strip()
@@ -249,10 +316,44 @@ async def handle_input_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Напишите текст или нажмите Отмена в сообщении выше.")
         return
     ensure_student(user.id, user.username, user.first_name, user.last_name)
-    add_help_request(user.id, awaiting, text)
-    who = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username or "Без имени"
-    await _notify_admin_help(context, awaiting, who, user.username, user.id, text)
-    await update.message.reply_text("Заявка отправлена. С вами свяжутся.")
+
+    # Заявки на помощь / встречу
+    if awaiting in ("help", "meeting"):
+        context.user_data.pop("awaiting_input", None)
+        add_help_request(user.id, awaiting, text)
+        who = f"{user.first_name or ''} {user.last_name or ''}".strip() or user.username or "Без имени"
+        await _notify_admin_help(context, awaiting, who, user.username, user.id, text)
+        await update.message.reply_text("Заявка отправлена. С вами свяжутся.")
+        return
+
+    # Добавление FAQ админом: сначала вопрос, потом ответ
+    if awaiting == "faq_q":
+        if user.id not in ADMIN_IDS:
+            context.user_data.pop("awaiting_input", None)
+            await update.message.reply_text("Добавлять FAQ может только админ.")
+            return
+        context.user_data["faq_question"] = text
+        context.user_data["awaiting_input"] = "faq_a"
+        await update.message.reply_text("Теперь напишите ответ на этот вопрос FAQ.")
+        return
+
+    if awaiting == "faq_a":
+        if user.id not in ADMIN_IDS:
+            context.user_data.pop("awaiting_input", None)
+            await update.message.reply_text("Добавлять FAQ может только админ.")
+            return
+        question = context.user_data.pop("faq_question", None)
+        context.user_data.pop("awaiting_input", None)
+        if not question:
+            await update.message.reply_text("Не найден вопрос для FAQ. Начните заново с команды /addfaq.")
+            return
+        faq_id = add_faq(question, text, user.id)
+        await update.message.reply_text(f"FAQ добавлен (#{faq_id}).")
+        return
+
+    # Неизвестное состояние — сбрасываем
+    context.user_data.pop("awaiting_input", None)
+    await update.message.reply_text("Состояние ввода потеряно. Попробуйте ещё раз или /start.")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -400,6 +501,10 @@ async def _callback_brief_handle(update: Update, context: ContextTypes.DEFAULT_T
             msg = _format_step(step, idx + 1, len(steps), url)
             keyboard = _steps_keyboard(idx, len(steps), url)
             await query.edit_message_text(msg, reply_markup=keyboard)
+
+        elif kind == "faq":
+            text = _format_faq()
+            await query.edit_message_text(text, reply_markup=_back_keyboard())
 
         elif kind == "help":
             context.user_data["awaiting_input"] = "help"
@@ -609,6 +714,8 @@ def main():
     else:
         logger.warning("JobQueue недоступен: установите python-telegram-bot[job-queue]. Утреннее напоминание отключено.")
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("faq", faq_cmd))
+    app.add_handler(CommandHandler("addfaq", addfaq_cmd))
     app.add_handler(CommandHandler("progress", progress_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input_message))

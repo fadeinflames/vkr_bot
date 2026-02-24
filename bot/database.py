@@ -60,6 +60,16 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES students(user_id)
         )
     """)
+    # FAQ по ВКР: вопросы/ответы, которые можно править из бота.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS faq (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            created_by INTEGER,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
     # Колонки могут быть добавлены позже — пытаемся добавить их, игнорируя ошибки, если уже существуют.
     try:
         cur.execute("ALTER TABLE students ADD COLUMN selected_brief_index INTEGER")
@@ -128,6 +138,45 @@ def clear_checklist_progress(user_id: int) -> int:
     return deleted
 
 
+def add_faq(question: str, answer: str, created_by: int | None = None) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO faq (question, answer, created_by) VALUES (?, ?, ?)",
+        (question, answer, created_by),
+    )
+    conn.commit()
+    faq_id = cur.lastrowid
+    conn.close()
+    return faq_id
+
+
+def list_faq(limit: int | None = 20) -> list[dict]:
+    conn = get_connection()
+    cur = conn.cursor()
+    if limit is not None:
+        cur.execute(
+            "SELECT id, question, answer, created_by, created_at FROM faq ORDER BY id ASC LIMIT ?",
+            (limit,),
+        )
+    else:
+        cur.execute(
+            "SELECT id, question, answer, created_by, created_at FROM faq ORDER BY id ASC",
+        )
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {
+            "id": r[0],
+            "question": r[1],
+            "answer": r[2],
+            "created_by": r[3],
+            "created_at": r[4],
+        }
+        for r in rows
+    ]
+
+
 def mark_brief_done(user_id: int, brief_index: int):
     conn = get_connection()
     cur = conn.cursor()
@@ -165,15 +214,26 @@ def get_all_students_with_progress():
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT s.user_id, s.username, s.first_name, s.last_name,
-               (SELECT COUNT(*) FROM progress p WHERE p.user_id = s.user_id) AS completed_count
+        SELECT s.user_id,
+               s.username,
+               s.first_name,
+               s.last_name,
+               s.selected_brief_index,
+               s.current_step_index
         FROM students s
         ORDER BY s.first_name, s.last_name
     """)
     rows = cur.fetchall()
     conn.close()
     return [
-        {"user_id": r[0], "username": r[1], "first_name": r[2], "last_name": r[3], "completed_count": r[4]}
+        {
+            "user_id": r[0],
+            "username": r[1],
+            "first_name": r[2],
+            "last_name": r[3],
+            "selected_brief_index": r[4],
+            "current_step_index": r[5],
+        }
         for r in rows
     ]
 
